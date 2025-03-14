@@ -1,88 +1,41 @@
 const puppeteer = require('puppeteer');
-const admin = require('firebase-admin');
 const { MAX_MENSAJES_POR_NUMERO, RETRASO_MIN, RETRASO_MAX } = require('./config');
-
-// Inicializa Firebase Admin. En Cloud Functions se configura automáticamente.
-admin.initializeApp();
-const db = admin.firestore();
 
 let whatsappSessions = []; // Guardará las sesiones activas
 
 /**
- * Carga las cookies almacenadas en Firestore.
- * @return {Promise<Array>} Una promesa que se resuelve con el array de cookies.
- */
-async function cargarCookies() {
-  try {
-    const doc = await db.collection('sessions').doc('whatsappSession').get();
-    if (!doc.exists) {
-      console.log('No se encontraron cookies almacenadas en Firestore.');
-      return [];
-    }
-    const data = doc.data();
-    console.log("cookies:", data);
-    return data.cookies || [];
-  } catch (error) {
-    console.error("Error al cargar cookies:", error);
-    return [];
-  }
-}
-
-/**
- * Guarda las cookies actualizadas en Firestore.
- * @param {Array} cookies El array de cookies a guardar.
+ * Inicia una nueva sesión de WhatsApp sin cargar ni guardar cookies persistentes.
+ * Se usará la sesión generada en el momento.
  * @return {Promise<void>}
  */
-async function guardarCookies(cookies) {
-  try {
-    await db.collection('sessions').doc('whatsappSession').set({ cookies });
-    console.log("Cookies actualizadas en Firestore.");
-  } catch (error) {
-    console.error("Error al guardar cookies:", error);
-  }
-}
-
-/**
- * Inicia una nueva sesión de WhatsApp.
- * Se carga las cookies desde Firestore, se inyectan en la página y luego se actualizan tras la navegación.
- * @return {Promise<void>} Una promesa que se resuelve cuando la sesión ha sido iniciada.
- */
 async function iniciarSesionWhatsApp() {
-  // Usamos headless: true en Firebase Cloud Functions
-  const browser = await puppeteer.launch({ headless: false });
+  // Usamos headless: false para poder ver WhatsApp Web y escanear el QR
+  const browser = await puppeteer.launch({
+    headless: false,
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  });
   const page = await browser.newPage();
 
-  // Cargar cookies desde Firestore e inyectarlas en la página
-  const cookies = await cargarCookies();
-  if (cookies.length > 0) {
-    await page.setCookie(...cookies);
-    console.log("Cookies cargadas en la sesión.");
-  }
-
-  // Navegar a WhatsApp Web y esperar a que la red se estabilice
+  // Ir directamente a WhatsApp Web sin inyectar cookies previas
   await page.goto('https://web.whatsapp.com', { waitUntil: 'networkidle2' });
-  console.log("Iniciando sesión en WhatsApp Web.");
+  console.log("Abriendo WhatsApp Web.");
 
-  // Intentar detectar si se muestra el QR para escanear (lo que indicaría que la sesión no se restauró)
+  // Esperar a que se muestre el QR para escanear
   try {
     await page.waitForSelector('canvas[aria-label="Scan me!"]', { timeout: 5000 });
-    console.log("QR code visible. Es necesario escanear para autenticar la sesión.");
-    // Esperar 30 segundos para permitir el escaneo del QR manual (en caso de que sea necesario)
-    await new Promise((resolve) => setTimeout(resolve, 30000));
+    console.log("QR code visible. Por favor, escanea el código para autenticar la sesión.");
+    // Espera 30 segundos para permitir escanear el código QR manualmente
+    await new Promise(resolve => setTimeout(resolve, 30000));
   } catch (e) {
-    console.log("Sesión restaurada correctamente, no se detectó QR.");
+    console.log("No se detectó el QR. Es posible que la sesión ya esté activa.");
   }
-
-  // Guardar las cookies actualizadas para futuras ejecuciones
-  const nuevasCookies = await page.cookies();
-  await guardarCookies(nuevasCookies);
 
   whatsappSessions.push({ browser, page, mensajesEnviados: 0 });
 }
 
 /**
- * Obtiene una sesión de WhatsApp disponible.
- * @return {object} La sesión con menos mensajes enviados.
+ * Obtiene la sesión de WhatsApp disponible (la que ha enviado menos mensajes).
+ * @return {object} La sesión activa.
  */
 function obtenerSesionDisponible() {
   return whatsappSessions.sort((a, b) => a.mensajesEnviados - b.mensajesEnviados)[0];
@@ -90,18 +43,18 @@ function obtenerSesionDisponible() {
 
 /**
  * Genera un retraso aleatorio entre mensajes.
- * @return {Promise<void>} Una promesa que se resuelve después del retraso.
+ * @return {Promise<void>}
  */
 function retrasoAleatorio() {
   const tiempo = Math.floor(Math.random() * (RETRASO_MAX - RETRASO_MIN + 1)) + RETRASO_MIN;
-  return new Promise((resolve) => setTimeout(resolve, tiempo));
+  return new Promise(resolve => setTimeout(resolve, tiempo));
 }
 
 /**
- * Envía un mensaje de WhatsApp a un número específico.
+ * Envía un mensaje de WhatsApp a un número específico utilizando la sesión activa.
  * @param {string} numero El número de teléfono destino.
  * @param {string} mensaje El mensaje a enviar.
- * @return {Promise<object>} Una promesa que se resuelve con el resultado del envío.
+ * @return {Promise<object>} Se resuelve con el resultado del envío.
  */
 async function enviarMensajeWhatsApp(numero, mensaje) {
   if (whatsappSessions.length === 0) {
@@ -114,21 +67,20 @@ async function enviarMensajeWhatsApp(numero, mensaje) {
   try {
     // Esperar un retraso aleatorio antes de enviar el mensaje
     await retrasoAleatorio();
-    // Esperar a que se cargue el chat y enviar el mensaje
+    // Esperar a que cargue el chat y enviar el mensaje
     await page.waitForSelector('div[contenteditable="true"]', { timeout: 60000 });
     await page.keyboard.press('Enter');
     console.log(`Mensaje enviado a ${numero}.`);
     session.mensajesEnviados += 1;
-    // Si se ha superado el límite de mensajes, se crea una nueva sesión
+    // Si se alcanza el límite de mensajes, se inicia una nueva sesión
     if (session.mensajesEnviados >= MAX_MENSAJES_POR_NUMERO) {
-      console.log("Número alcanzó el límite. Cambiando de sesión.");
-      whatsappSessions = whatsappSessions.filter((s) => s !== session);
+      console.log("Límite de mensajes alcanzado. Creando nueva sesión.");
+      whatsappSessions = whatsappSessions.filter(s => s !== session);
       await iniciarSesionWhatsApp();
-      console.log("Sesiones activas:", whatsappSessions.length);
     }
     return { success: true };
   } catch (error) {
-    console.error("Error enviando mensaje, reintentando...", error);
+    console.error("Error al enviar mensaje, reintentando...", error);
     await retrasoAleatorio();
     return await enviarMensajeWhatsApp(numero, mensaje);
   }
@@ -136,5 +88,5 @@ async function enviarMensajeWhatsApp(numero, mensaje) {
 
 module.exports = {
   iniciarSesionWhatsApp,
-  enviarMensajeWhatsApp,
+  enviarMensajeWhatsApp
 };
