@@ -70,7 +70,7 @@ async function enviarMensajeWhatsApp(numero, mensaje) {
     // Esperar a que cargue el chat y enviar el mensaje
     await page.waitForSelector('div[contenteditable="true"]', { timeout: 60000 });
     await page.keyboard.press('Enter');
-    await page.waitForTimeout(1000);
+    await new Promise(resolve => setTimeout(resolve, 1000));
     console.log(`Mensaje enviado a ${numero}.`);
     session.mensajesEnviados += 1;
     // Si se alcanza el límite de mensajes, se inicia una nueva sesión
